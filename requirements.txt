@@ -1,0 +1,3 @@
+# The engine itself has zero runtime dependencies - it is pure standard
+# library sockets.  pytest is only needed to run the test suite.
+pytest>=7.4

@@ -1,0 +1,110 @@
+name: FIX Engine CI
+
+# Run on every push and on every pull request, so a broken order flow is
+# caught before it is merged rather than during a demo.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A newer push supersedes an in-flight run on the same ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  order-flow:
+    name: Order flow (${{ matrix.fix-version }}, Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Let both dictionary versions report, rather than cancelling the other
+      # the moment one fails - the difference between them is usually the bug.
+      fail-fast: false
+      matrix:
+        fix-version: ["FIX.4.2", "FIX.4.4"]
+        python-version: ["3.11", "3.12"]
+
+    env:
+      FIX_HOST: 127.0.0.1
+      FIX_PORT: 9876
+      FIX_VERSION: ${{ matrix.fix-version }}
+      FIX_LOG_DIR: logs
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start the FIX acceptor in the background
+        run: |
+          mkdir -p logs
+          # nohup + & detaches the mock broker so it outlives this step and is
+          # still listening when pytest runs in the next one.
+          nohup python scripts/run_acceptor.py \
+            --host "$FIX_HOST" \
+            --port "$FIX_PORT" \
+            --fix-version "$FIX_VERSION" \
+            --log-file logs/acceptor.log \
+            > logs/acceptor-stdout.log 2>&1 &
+          echo $! > acceptor.pid
+          echo "acceptor started with PID $(cat acceptor.pid)"
+
+      - name: Wait for port ${{ env.FIX_PORT }} to accept connections
+        run: |
+          # Starting a process is not the same as its socket being bound;
+          # without this gate pytest races the listener and fails with
+          # "connection refused". A socket probe is used instead of `nc`,
+          # whose flags differ between the BSD and GNU builds.
+          python scripts/wait_for_port.py "$FIX_HOST" "$FIX_PORT" --timeout 30
+
+      - name: Run the FIX integration test suite
+        run: |
+          set -o pipefail
+          # -s streams the raw pipe-delimited FIX traffic straight into the job
+          # log, so the wire protocol is readable in the Actions UI.
+          python -m pytest -v -s --color=yes 2>&1 | tee logs/pytest.log
+
+      - name: Show the acceptor's view of the session
+        if: always()
+        run: |
+          echo "::group::acceptor.log"
+          cat logs/acceptor.log || echo "(no acceptor log produced)"
+          echo "::endgroup::"
+
+      - name: Stop the FIX acceptor
+        if: always()
+        run: |
+          if [ -f acceptor.pid ]; then
+            # SIGTERM lets the acceptor close its listener and flush its logs.
+            kill "$(cat acceptor.pid)" 2>/dev/null || true
+            rm -f acceptor.pid
+          fi
+
+      - name: Upload FIX session logs
+        # `always()` so the logs survive a failing run - which is exactly when
+        # the raw wire traffic is worth reading.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Artifact names must be unique across matrix jobs in v4.
+          name: fix-logs-${{ matrix.fix-version }}-py${{ matrix.python-version }}
+          path: |
+            logs/
+          if-no-files-found: warn
+          retention-days: 14
